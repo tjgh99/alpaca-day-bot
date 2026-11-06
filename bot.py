@@ -245,12 +245,10 @@ def summary():
         lines.append(f"  {p.symbol} x{p.qty}  unrealized {float(p.unrealized_pl):+,.2f}")
 
     subject = f"Trading bot {today}: {equity - last_equity:+,.2f} ({equity / last_equity - 1:+.2%})"
-    body = "
-".join(lines)
+    body = "\n".join(lines)
     webhook = os.environ.get("SLACK_WEBHOOK_URL")
     if webhook:
-        payload = json.dumps({"text": f"*{subject}*
-```{body}```"}).encode()
+        payload = json.dumps({"text": f"*{subject}*\n```{body}```"}).encode()
         req = urllib.request.Request(webhook, payload, {"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=30).read()
         log.info("summary posted to Slack")
