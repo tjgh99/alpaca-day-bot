@@ -3,17 +3,19 @@
 Usage:
     python bot.py trade     # run the trading loop until the flatten time
     python bot.py flatten   # cancel all orders and close all positions
-    python bot.py summary   # email the day's trades and P&L (skips non-trading days)
+    python bot.py summary   # post the day's trades and P&L (skips non-trading days)
 
 Long-only. Entries are bracket orders (server-side stop and target).
 Always connects to the paper endpoint, regardless of environment settings.
 """
+import json
 import logging
 import math
 import os
 import smtplib
 import sys
 import time
+import urllib.request
 from datetime import time as dtime, timedelta
 from email.message import EmailMessage
 
@@ -242,11 +244,23 @@ def summary():
     for p in positions:
         lines.append(f"  {p.symbol} x{p.qty}  unrealized {float(p.unrealized_pl):+,.2f}")
 
+    subject = f"Trading bot {today}: {equity - last_equity:+,.2f} ({equity / last_equity - 1:+.2%})"
+    body = "
+".join(lines)
+    webhook = os.environ.get("SLACK_WEBHOOK_URL")
+    if webhook:
+        payload = json.dumps({"text": f"*{subject}*
+```{body}```"}).encode()
+        req = urllib.request.Request(webhook, payload, {"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=30).read()
+        log.info("summary posted to Slack")
+        return
+
     msg = EmailMessage()
-    msg["Subject"] = f"Trading bot {today}: {equity - last_equity:+,.2f} ({equity / last_equity - 1:+.2%})"
+    msg["Subject"] = subject
     msg["From"] = os.environ["SMTP_USER"]
     msg["To"] = os.environ["EMAIL_TO"]
-    msg.set_content("\n".join(lines))
+    msg.set_content(body)
     with smtplib.SMTP("smtp-mail.outlook.com", 587) as smtp:
         smtp.starttls()
         smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
