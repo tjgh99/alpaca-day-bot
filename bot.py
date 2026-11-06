@@ -3,6 +3,7 @@
 Usage:
     python bot.py trade     # run the trading loop until the flatten time
     python bot.py flatten   # cancel all orders and close all positions
+    python bot.py summary   # email the day's trades and P&L (skips non-trading days)
 
 Long-only. Entries are bracket orders (server-side stop and target).
 Always connects to the paper endpoint, regardless of environment settings.
@@ -10,9 +11,11 @@ Always connects to the paper endpoint, regardless of environment settings.
 import logging
 import math
 import os
+import smtplib
 import sys
 import time
 from datetime import timedelta
+from email.message import EmailMessage
 
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
@@ -21,6 +24,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
+    GetCalendarRequest,
     GetOrdersRequest,
     MarketOrderRequest,
     StopLossRequest,
@@ -184,6 +188,50 @@ def trade():
         time.sleep(POLL_SECONDS)
 
 
+def summary():
+    trading, _ = make_clients()
+    clock = trading.get_clock()
+    today = clock.timestamp.date()
+    if not trading.get_calendar(GetCalendarRequest(start=today, end=today)):
+        log.info("%s is not a trading day; no summary", today)
+        return
+    acct = trading.get_account()
+    equity, last_equity = float(acct.equity), float(acct.last_equity)
+    after = clock.timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+    orders = trading.get_orders(
+        GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=after, limit=500)
+    )
+    fills = sorted(
+        (o for o in orders if o.filled_qty and float(o.filled_qty) > 0),
+        key=lambda o: o.filled_at,
+    )
+    lines = [
+        f"Paper account summary for {today}",
+        f"Equity: ${equity:,.2f}  ({equity - last_equity:+,.2f}, {equity / last_equity - 1:+.2%} vs prior close)",
+        f"Buying power: ${float(acct.buying_power):,.2f}",
+        "",
+        f"Fills today: {len(fills)}",
+    ]
+    for o in fills:
+        t = o.filled_at.astimezone(clock.timestamp.tzinfo).strftime("%H:%M")
+        lines.append(f"  {t}  {o.side.value.upper():4} {o.symbol:5} x{o.filled_qty} @ {float(o.filled_avg_price):.2f}")
+    positions = trading.get_all_positions()
+    lines += ["", f"Open positions: {len(positions)}"]
+    for p in positions:
+        lines.append(f"  {p.symbol} x{p.qty}  unrealized {float(p.unrealized_pl):+,.2f}")
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Trading bot {today}: {equity - last_equity:+,.2f} ({equity / last_equity - 1:+.2%})"
+    msg["From"] = os.environ["SMTP_USER"]
+    msg["To"] = os.environ["EMAIL_TO"]
+    msg.set_content("\n".join(lines))
+    with smtplib.SMTP("smtp-mail.outlook.com", 587) as smtp:
+        smtp.starttls()
+        smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+        smtp.send_message(msg)
+    log.info("summary emailed to %s", msg["To"])
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     mode = sys.argv[1] if len(sys.argv) > 1 else "trade"
@@ -191,5 +239,7 @@ if __name__ == "__main__":
         flatten(make_clients()[0])
     elif mode == "trade":
         trade()
+    elif mode == "summary":
+        summary()
     else:
-        sys.exit(f"unknown mode {mode!r}; use trade or flatten")
+        sys.exit(f"unknown mode {mode!r}; use trade, flatten or summary")
