@@ -1,0 +1,22 @@
+name: flatten
+on:
+  schedule:
+    # Safety net at 15:50 ET in both EDT and EST; flattening twice is harmless.
+    - cron: "50 19 * * 1-5"
+    - cron: "50 20 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  flatten:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python bot.py flatten
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
