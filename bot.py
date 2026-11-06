@@ -14,7 +14,7 @@ import os
 import smtplib
 import sys
 import time
-from datetime import timedelta
+from datetime import time as dtime, timedelta
 from email.message import EmailMessage
 
 from alpaca.data.enums import DataFeed
@@ -33,11 +33,13 @@ from alpaca.trading.requests import (
 
 UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "AMZN", "META", "GOOGL"]
 
-# Risk limits (moderate profile)
-MAX_POSITION_PCT = 0.20     # max notional per position, share of equity
-RISK_PER_TRADE_PCT = 0.02   # equity risked per trade (entry to stop)
-DAILY_LOSS_HALT_PCT = 0.05  # stop trading and flatten at this drawdown on the day
-MAX_OPEN_POSITIONS = 5
+# Risk limits (moderate-high profile)
+MAX_POSITION_PCT = 0.25     # max notional per position, share of equity
+RISK_PER_TRADE_PCT = 0.025  # equity risked per trade (entry to stop)
+DAILY_LOSS_HALT_PCT = 0.06  # stop trading and flatten at this drawdown on the day
+MAX_OPEN_POSITIONS = 8
+MAX_ENTRIES_PER_DAY = 15
+MAX_ENTRIES_PER_SYMBOL = 2
 REWARD_RISK = 2.0           # take-profit distance as a multiple of stop distance
 
 # Signal parameters (1-minute bars)
@@ -47,7 +49,11 @@ VOLUME_MULT = 1.5
 ATR_LOOKBACK = 14
 ATR_STOP_MULT = 1.5
 MIN_STOP_PCT = 0.004
-COOLDOWN = timedelta(minutes=15)
+COOLDOWN = timedelta(minutes=30)
+
+# Entries only between these times (ET): skips the noisy open and the late-day drift
+ENTRY_START = dtime(9, 45)
+ENTRY_END = dtime(14, 30)
 
 POLL_SECONDS = 30
 FLATTEN_BEFORE_CLOSE = timedelta(minutes=45)
@@ -98,6 +104,14 @@ def signal(df, now):
     return None
 
 
+def market_is_up(spy):
+    """Only take long breakouts while SPY trades above its own VWAP."""
+    if spy is None or spy["volume"].sum() == 0:
+        return False
+    typical = (spy["high"] + spy["low"] + spy["close"]) / 3
+    return float(spy["close"].iloc[-1]) > float((typical * spy["volume"]).sum() / spy["volume"].sum())
+
+
 def position_size(equity, buying_power, price, stop_dist):
     qty = min(
         equity * RISK_PER_TRADE_PCT / stop_dist,
@@ -125,6 +139,7 @@ def trade():
 
     day_start = clock.timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
     last_entry = {}
+    entries = {}
     log.info("trading until %s", flatten_at)
 
     while True:
@@ -149,14 +164,20 @@ def trade():
             for o in trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100))
         }
         slots = MAX_OPEN_POSITIONS - len(held)
+        in_window = ENTRY_START <= now.time() <= ENTRY_END
 
-        if slots > 0:
+        if slots > 0 and in_window and sum(entries.values()) < MAX_ENTRIES_PER_DAY:
             bars = fetch_bars(data, day_start)
+            if not market_is_up(bars.get("SPY")):
+                time.sleep(POLL_SECONDS)
+                continue
             buying_power = float(acct.buying_power)
             for sym in UNIVERSE:
                 if slots <= 0:
                     break
                 if sym in held or sym in pending or sym not in bars:
+                    continue
+                if entries.get(sym, 0) >= MAX_ENTRIES_PER_SYMBOL:
                     continue
                 if sym in last_entry and now - last_entry[sym] < COOLDOWN:
                     continue
@@ -182,6 +203,7 @@ def trade():
                 )
                 log.info("BUY %s x%d @~%.2f stop %.2f target %.2f", sym, qty, price, stop, target)
                 last_entry[sym] = now
+                entries[sym] = entries.get(sym, 0) + 1
                 buying_power -= qty * price
                 slots -= 1
 
