@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import smtplib
 import sys
 import time
@@ -21,7 +22,8 @@ from email.message import EmailMessage
 
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.historical.news import NewsClient
+from alpaca.data.requests import NewsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
@@ -33,7 +35,21 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
 )
 
-UNIVERSE = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "AMZN", "META", "GOOGL"]
+UNIVERSE = [
+    "SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "AMZN", "META", "GOOGL",
+    "PLTR", "J", "MU", "AVGO", "NFLX", "COIN", "HOOD", "SOFI", "UBER", "SMCI",
+    "CRWD", "ARM", "SHOP", "INTC", "ORCL",
+]
+
+# Headlines matching any of these block a buy and trigger an early exit on a held position.
+NEGATIVE_NEWS = re.compile(
+    r"\b(downgrad\w*|lawsuit|sued|sues|investigation|probe|subpoena|fraud|recall|bankruptcy|"
+    r"delist\w*|halted|short seller|short report|data breach|cyberattack|resigns?|steps down|"
+    r"misses|missed estimates|cuts? (?:guidance|forecast|outlook)|lowers? (?:guidance|forecast|outlook)|"
+    r"(?:public|secondary|stock) offering|plunges?|plummets?|tumbles?|sinks?)\b",
+    re.IGNORECASE,
+)
+NEWS_LOOKBACK = timedelta(hours=18)
 
 # Risk limits (moderate-high profile)
 MAX_POSITION_PCT = 0.25     # max notional per position, share of equity
@@ -69,15 +85,48 @@ def make_clients():
     return TradingClient(key, secret, paper=True), StockHistoricalDataClient(key, secret)
 
 
+def make_news_client():
+    return NewsClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"])
+
+
+def bad_news(news, sym, since):
+    """Return the first negative headline for sym published after `since`, or None.
+
+    Fails closed: if news can't be fetched, treat it as bad news so no buy goes out blind.
+    """
+    try:
+        items = news.get_news(NewsRequest(symbols=sym, start=since, limit=20, sort="desc")).data["news"]
+    except Exception as exc:
+        log.warning("news fetch failed for %s (%s); treating as blocked", sym, exc)
+        return "news unavailable"
+    for item in items:
+        if NEGATIVE_NEWS.search(item.headline):
+            return item.headline
+    return None
+
+
+def tradable_universe(trading):
+    ok = []
+    for sym in UNIVERSE:
+        try:
+            if trading.get_asset(sym).tradable:
+                ok.append(sym)
+                continue
+        except Exception:
+            pass
+        log.warning("dropping %s: not found or not tradable", sym)
+    return ok
+
+
 def flatten(trading):
     trading.cancel_orders()
     trading.close_all_positions(cancel_orders=True)
     log.info("flattened: all orders cancelled, all positions closed")
 
 
-def fetch_bars(data, start):
+def fetch_bars(data, symbols, start):
     req = StockBarsRequest(
-        symbol_or_symbols=UNIVERSE,
+        symbol_or_symbols=symbols,
         timeframe=TimeFrame.Minute,
         start=start,
         feed=DataFeed.IEX,
@@ -142,7 +191,10 @@ def trade():
     day_start = clock.timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
     last_entry = {}
     entries = {}
-    log.info("trading until %s", flatten_at)
+    news = make_news_client()
+    symbols = tradable_universe(trading)
+    started = clock.timestamp
+    log.info("trading %d symbols until %s", len(symbols), flatten_at)
 
     while True:
         now = trading.get_clock().timestamp
@@ -161,6 +213,17 @@ def trade():
             return
 
         held = {p.symbol for p in trading.get_all_positions()}
+
+        # Early exit: negative headline published since the bot started
+        for sym in sorted(held):
+            headline = bad_news(news, sym, started)
+            if headline and headline != "news unavailable":
+                for o in trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[sym])):
+                    trading.cancel_order_by_id(o.id)
+                trading.close_position(sym)
+                log.info("SELL %s early on news: %s", sym, headline)
+                held.discard(sym)
+
         pending = {
             o.symbol
             for o in trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100))
@@ -169,12 +232,12 @@ def trade():
         in_window = ENTRY_START <= now.time() <= ENTRY_END
 
         if slots > 0 and in_window and sum(entries.values()) < MAX_ENTRIES_PER_DAY:
-            bars = fetch_bars(data, day_start)
+            bars = fetch_bars(data, symbols, day_start)
             if not market_is_up(bars.get("SPY")):
                 time.sleep(POLL_SECONDS)
                 continue
             buying_power = float(acct.buying_power)
-            for sym in UNIVERSE:
+            for sym in symbols:
                 if slots <= 0:
                     break
                 if sym in held or sym in pending or sym not in bars:
@@ -187,6 +250,11 @@ def trade():
                 if not sig:
                     continue
                 price, stop_dist = sig
+                headline = bad_news(news, sym, now - NEWS_LOOKBACK)
+                if headline:
+                    log.info("skip %s breakout, news: %s", sym, headline)
+                    last_entry[sym] = now  # don't re-check this symbol every 30s
+                    continue
                 qty = position_size(equity, buying_power, price, stop_dist)
                 if qty < 1:
                     continue
@@ -266,6 +334,20 @@ def summary():
     log.info("summary emailed to %s", msg["To"])
 
 
+def check():
+    """Read-only diagnostic: verify keys, ticker list and news access without trading."""
+    trading, data = make_clients()
+    symbols = tradable_universe(trading)
+    log.info("tradable: %d/%d symbols; dropped: %s", len(symbols), len(UNIVERSE),
+             sorted(set(UNIVERSE) - set(symbols)))
+    news = make_news_client()
+    since = trading.get_clock().timestamp - NEWS_LOOKBACK
+    items = news.get_news(NewsRequest(symbols="NVDA", start=since, limit=5, sort="desc")).data["news"]
+    log.info("news ok: %d items for NVDA; sample: %s", len(items), items[0].headline if items else "none")
+    for sym in symbols:
+        log.info("%s news block: %s", sym, bad_news(news, sym, since))
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     mode = sys.argv[1] if len(sys.argv) > 1 else "trade"
@@ -275,5 +357,7 @@ if __name__ == "__main__":
         trade()
     elif mode == "summary":
         summary()
+    elif mode == "check":
+        check()
     else:
         sys.exit(f"unknown mode {mode!r}; use trade, flatten or summary")
