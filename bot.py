@@ -96,6 +96,22 @@ def make_news_client():
 
 _finbert = None
 _scores = {}
+NAMES = {}  # symbol -> first word of company name, used to check an article is about the stock
+
+# Serious events block a buy whatever the sentiment model says (it underrates legal/regulatory news).
+SEVERE_NEWS = re.compile(
+    r"\b(investigation|subpoena|fraud|bankruptcy|delist\w*|halted|recall|sec charges|"
+    r"data breach|cyberattack|short report|short seller)\b",
+    re.IGNORECASE,
+)
+
+
+def about_symbol(item, sym):
+    """True if the article is plausibly about sym, not just tagged with it."""
+    if len(item.symbols) == 1:
+        return True
+    text = f"{item.headline} {item.summary or ''}".lower()
+    return bool(re.search(rf"\b{re.escape(sym.lower())}\b", text) or NAMES.get(sym, sym.lower()) in text)
 
 
 def load_finbert():
@@ -141,9 +157,9 @@ def bad_news(news, sym, since):
     now = datetime.now(timezone.utc)
     worst = None
     for item in items:
-        if len(item.symbols) > MAX_TAGGED_SYMBOLS:
+        if len(item.symbols) > MAX_TAGGED_SYMBOLS or not about_symbol(item, sym):
             continue
-        score = negative_score(item)
+        score = 1.0 if SEVERE_NEWS.search(item.headline) else negative_score(item)
         threshold = RECENT_THRESHOLD if now - item.created_at < RECENT_WINDOW else OLDER_THRESHOLD
         if score >= threshold and (worst is None or score > worst[0]):
             worst = (score, item.headline)
@@ -154,8 +170,11 @@ def tradable_universe(trading):
     ok = []
     for sym in UNIVERSE:
         try:
-            if trading.get_asset(sym).tradable:
+            asset = trading.get_asset(sym)
+            if asset.tradable:
                 ok.append(sym)
+                first = re.sub(r"[^a-z0-9]", "", (asset.name or "").split(" ")[0].lower())
+                NAMES[sym] = first if len(first) >= 4 else sym.lower()
                 continue
         except Exception:
             pass
