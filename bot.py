@@ -17,7 +17,7 @@ import smtplib
 import sys
 import time
 import urllib.request
-from datetime import time as dtime, timedelta
+from datetime import datetime, timezone, time as dtime, timedelta
 from email.message import EmailMessage
 
 from alpaca.data.enums import DataFeed
@@ -50,6 +50,11 @@ NEGATIVE_NEWS = re.compile(
     re.IGNORECASE,
 )
 NEWS_LOOKBACK = timedelta(hours=18)
+NEWS_UNAVAILABLE = "news unavailable"
+MAX_TAGGED_SYMBOLS = 3
+RECENT_WINDOW = timedelta(hours=2)
+RECENT_THRESHOLD = 0.70   # negative-probability needed to block when the article is under 2h old
+OLDER_THRESHOLD = 0.85    # ... and when it is older
 
 # Risk limits (moderate-high profile)
 MAX_POSITION_PCT = 0.25     # max notional per position, share of equity
@@ -89,20 +94,60 @@ def make_news_client():
     return NewsClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"])
 
 
-def bad_news(news, sym, since):
-    """Return the first negative headline for sym published after `since`, or None.
+_finbert = None
+_scores = {}
 
-    Fails closed: if news can't be fetched, treat it as bad news so no buy goes out blind.
+
+def load_finbert():
+    """Load the FinBERT sentiment model; on failure the keyword filter is used instead."""
+    global _finbert
+    try:
+        from transformers import pipeline
+
+        _finbert = pipeline("text-classification", model="ProsusAI/finbert", top_k=None,
+                            truncation=True, max_length=256)
+        log.info("FinBERT loaded")
+    except Exception as exc:
+        log.warning("FinBERT unavailable (%s); falling back to keyword filter", exc)
+
+
+def negative_score(item):
+    """Probability (0-1) that an article is negative news. Cached per article."""
+    if item.id in _scores:
+        return _scores[item.id]
+    if _finbert is None:
+        score = 1.0 if NEGATIVE_NEWS.search(item.headline) else 0.0
+    else:
+        out = _finbert(f"{item.headline}. {item.summary or ''}"[:1000])
+        if out and isinstance(out[0], list):
+            out = out[0]
+        score = next(d["score"] for d in out if d["label"].lower() == "negative")
+    _scores[item.id] = score
+    return score
+
+
+def bad_news(news, sym, since):
+    """Return the most damning negative headline about sym published after `since`, or None.
+
+    Only articles that tag few tickers count, since broad market stories say little about one stock.
+    Articles from the last two hours use a lower threshold than older ones.
+    Fails closed: if news can't be fetched, return a blocking marker so no buy goes out blind.
     """
     try:
         items = news.get_news(NewsRequest(symbols=sym, start=since, limit=20, sort="desc")).data["news"]
     except Exception as exc:
         log.warning("news fetch failed for %s (%s); treating as blocked", sym, exc)
-        return "news unavailable"
+        return NEWS_UNAVAILABLE
+    now = datetime.now(timezone.utc)
+    worst = None
     for item in items:
-        if NEGATIVE_NEWS.search(item.headline):
-            return item.headline
-    return None
+        if len(item.symbols) > MAX_TAGGED_SYMBOLS:
+            continue
+        score = negative_score(item)
+        threshold = RECENT_THRESHOLD if now - item.created_at < RECENT_WINDOW else OLDER_THRESHOLD
+        if score >= threshold and (worst is None or score > worst[0]):
+            worst = (score, item.headline)
+    return f"{worst[1]} (negative {worst[0]:.2f})" if worst else None
 
 
 def tradable_universe(trading):
@@ -192,6 +237,7 @@ def trade():
     last_entry = {}
     entries = {}
     news = make_news_client()
+    load_finbert()
     symbols = tradable_universe(trading)
     started = clock.timestamp
     log.info("trading %d symbols until %s", len(symbols), flatten_at)
@@ -217,7 +263,7 @@ def trade():
         # Early exit: negative headline published since the bot started
         for sym in sorted(held):
             headline = bad_news(news, sym, started)
-            if headline and headline != "news unavailable":
+            if headline and headline != NEWS_UNAVAILABLE:
                 for o in trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[sym])):
                     trading.cancel_order_by_id(o.id)
                 trading.close_position(sym)
@@ -341,6 +387,19 @@ def check():
     log.info("tradable: %d/%d symbols; dropped: %s", len(symbols), len(UNIVERSE),
              sorted(set(UNIVERSE) - set(symbols)))
     news = make_news_client()
+    load_finbert()
+    if _finbert:
+        samples = [
+            "Micron beats earnings estimates and raises guidance",
+            "SEC opens investigation into company accounting practices",
+            "Probe cleared, shares jump as regulator drops case",
+            "Analyst downgrades stock citing slowing demand",
+            "Company announces new product launch",
+        ]
+        for text in samples:
+            out = _finbert(text)
+            out = out[0] if out and isinstance(out[0], list) else out
+            log.info("sentiment %s -> %s", text, {d["label"]: round(d["score"], 2) for d in out})
     since = trading.get_clock().timestamp - NEWS_LOOKBACK
     items = news.get_news(NewsRequest(symbols="NVDA", start=since, limit=5, sort="desc")).data["news"]
     log.info("news ok: %d items for NVDA; sample: %s", len(items), items[0].headline if items else "none")
