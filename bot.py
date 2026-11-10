@@ -255,6 +255,8 @@ def trade():
     day_start = clock.timestamp.replace(hour=9, minute=30, second=0, microsecond=0)
     last_entry = {}
     entries = {}
+    last_market_up = None
+    loops = 0
     news = make_news_client()
     load_finbert()
     symbols = tradable_universe(trading)
@@ -298,7 +300,13 @@ def trade():
 
         if slots > 0 and in_window and sum(entries.values()) < MAX_ENTRIES_PER_DAY:
             bars = fetch_bars(data, symbols, day_start)
-            if not market_is_up(bars.get("SPY")):
+            market_up = market_is_up(bars.get("SPY"))
+            if market_up != last_market_up or loops % 20 == 0:
+                log.info("status: SPY above VWAP=%s, positions=%d, entries today=%d, equity=%.2f",
+                         market_up, len(held), sum(entries.values()), equity)
+                last_market_up = market_up
+            loops += 1
+            if not market_up:
                 time.sleep(POLL_SECONDS)
                 continue
             buying_power = float(acct.buying_power)
